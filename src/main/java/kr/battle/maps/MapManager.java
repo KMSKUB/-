@@ -16,17 +16,22 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Stream;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.storage.LevelResource;
@@ -45,8 +50,10 @@ import xyz.nucleoid.fantasy.RuntimeLevelConfig;
  *  [서버 시작]  dirty 인 맵  -> (폴더 삭제) -> 원본 복사 / 새 야생 -> 월드 열기
  *               깨끗한 맵   -> 그대로 월드 열기
  *  [게임 중]    #game 상태가 4~6(맵 로딩/배틀/시상식)이면 그 맵을 dirty 로 표시 (상태 파일에 즉시 저장)
- *  [게임 끝]    로비로 돌아온 뒤 0.5초 지나면 dirty 맵을  월드 삭제 -> 폴더 삭제 -> 원본 복사(도시) / 새 시드(야생) -> 월드 다시 열기
- *  [상태 알림]  #maps bt.state = 1 준비됨 / 2 초기화 중 / 3 오류  (데이터팩이 읽음)
+ *  [게임 끝]    로비로 돌아온 뒤 0.5초 지나면 dirty 맵을  월드 삭제 -> 옛 월드 객체 닫기(밀린 저장 마무리) -> 폴더 삭제
+ *               -> 원본 복사(도시: region/entities/poi 만) / 새 시드(야생) -> 월드 다시 열기
+ *  [상태 알림]  #maps bt.state = 1 준비됨 / 2 초기화 중 / 3 오류,  #st1~#st4 = 맵별 상태 (데이터팩이 읽음)
+ *  [수동 요청]  데이터팩이 #resetreq bt.state 를 1 로 두면 모든 맵을 '쓴 맵'으로 보고 로비에서 다시 채운다
  * </pre>
  */
 final class MapManager {
@@ -58,6 +65,14 @@ final class MapManager {
 	private static final int DELETE_TIMEOUT = 400;
 	/** 실패 뒤 재시도까지 기다리는 틱 */
 	private static final int RETRY_TICKS = 1200;
+	/** 옛 월드를 닫는 데(밀린 파일 쓰기 마무리) 이만큼(틱) 걸려도 기다리지 않고 진행 */
+	private static final int CLOSE_TIMEOUT = 400;
+	/** 원본에서 region 폴더를 못 찾았을 때 다시 찾아보기까지의 틱 (5초) */
+	private static final int SOURCE_RECHECK_TICKS = 100;
+	/** 폴더를 못 지웠을 때 다시 시도하기까지의 틱 (5분) */
+	private static final int DELETE_RETRY_TICKS = 6000;
+	/** 원본에서 복사하는 폴더들 (그 밖의 파일은 가져가지 않는다) */
+	private static final String[] COPY_DIRS = {"region", "entities", "poi"};
 
 	private static final String OBJ = "bt.state";
 
@@ -97,12 +112,15 @@ final class MapManager {
 	private final Path stateFile;
 	private final List<MapSlot> slots = new ArrayList<>();
 	private final ExecutorService io;
+	/** 옛 월드 닫기 전용 스레드 (혹시 오래 걸려도 원본 복사가 그 뒤에 막히지 않게 따로 둔다) */
+	private final ExecutorService closer;
 	private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
 
 	private long arenaSeed;
 	private int quiet;
 	private int lastState = Integer.MIN_VALUE;
 	private int published = -1;
+	private int[] publishedStatus = new int[0];
 	private int sincePublish;
 	private int errorLogCooldown;
 
@@ -114,6 +132,11 @@ final class MapManager {
 		this.stateFile = root.resolve("battle_maps_state.json");
 		this.io = Executors.newSingleThreadExecutor(r -> {
 			Thread t = new Thread(r, "BattleMaps-IO");
+			t.setDaemon(true);
+			return t;
+		});
+		this.closer = Executors.newSingleThreadExecutor(r -> {
+			Thread t = new Thread(r, "BattleMaps-Close");
 			t.setDaemon(true);
 			return t;
 		});
@@ -161,6 +184,7 @@ final class MapManager {
 				LOG.error("[BattleMaps] {} 월드가 이미 존재합니다. 데이터팩의 data/battle/dimension/ 폴더(arena.json, city1~3.json)를 지워 주세요. 이 맵은 관리하지 않습니다.", s.id);
 				s.phase = MapSlot.Phase.CLOSED;
 				s.cooldown = Integer.MAX_VALUE;
+				s.unmanaged = true;
 				continue;
 			}
 			if (s.dirty) {
@@ -181,6 +205,7 @@ final class MapManager {
 			LOG.warn("[BattleMaps] 종료 처리 중 오류", t);
 		}
 		io.shutdownNow();
+		closer.shutdownNow();
 	}
 
 	// ------------------------------------------------------------------ 매 틱
@@ -215,6 +240,22 @@ final class MapManager {
 		}
 		lastState = state;
 
+		// 1-2) 데이터팩의 수동 초기화 요청 (/function battle:admin/maps_reset): 모든 맵을 '쓴 맵'으로 표시 -> 로비에서 곧바로 초기화
+		if (readScore("#resetreq") == 1) {
+			writeScore("#resetreq", 0);
+			for (MapSlot s : slots) {
+				if (!s.unmanaged) {
+					s.dirty = true;
+					s.sourceWarned = false;
+					if (s.phase == MapSlot.Phase.OPEN || s.phase == MapSlot.Phase.CLOSED) {
+						s.cooldown = 0;
+					}
+				}
+			}
+			saveState();
+			LOG.info("[BattleMaps] 수동 초기화 요청을 받았습니다. 로비에서 모든 맵을 새로 준비합니다.");
+		}
+
 		// 2) 로비(0) 또는 시상식(6)이 잠시 이어지면 쓴 맵 초기화 시작
 		if (state == 0 || state == 6) {
 			quiet++;
@@ -231,7 +272,8 @@ final class MapManager {
 
 		if (quiet >= QUIET_TICKS) {
 			for (MapSlot s : slots) {
-				if (s.dirty && s.phase == MapSlot.Phase.OPEN && s.cooldown == 0 && canReset(s)) {
+				boolean idle = s.phase == MapSlot.Phase.OPEN || s.phase == MapSlot.Phase.CLOSED;
+				if (s.dirty && !s.unmanaged && idle && s.cooldown == 0) {
 					startReset(s);
 				}
 			}
@@ -251,27 +293,98 @@ final class MapManager {
 
 	// ------------------------------------------------------------------ 초기화 단계
 
-	/** 야생은 항상 초기화 가능, 도시는 원본 폴더가 있어야 가능 */
-	private boolean canReset(MapSlot s) {
-		return s.wild || Files.isDirectory(originals.resolve(s.name));
-	}
-
-	/** 초기화 시작. 월드가 열려 있으면 먼저 삭제를 요청한다. */
+	/**
+	 * 초기화 시작. 도시는 원본 폴더에서 region 이 든 곳을 먼저 찾고(없으면 폴더를 건드리지 않고 건너뜀),
+	 * 월드가 열려 있으면 먼저 삭제를 요청한다.
+	 */
 	private void startReset(MapSlot s) {
-		if (!canReset(s)) {
-			// 원본이 없으면 폴더를 건드리지 않는다 (직접 넣어 둔 맵 보호). dirty 는 그대로 두므로,
-			// 나중에 원본을 넣고 월드를 다시 열면 그때 새 복사본으로 교체된다.
-			LOG.warn("[BattleMaps] {} 의 원본이 없어 초기화를 건너뜁니다. 원본을 {} 에 넣어 주세요.", s.id, originals.resolve(s.name));
-			return;
+		Path src = null;
+		if (!s.wild) {
+			src = findSource(s);
+			if (src == null) {
+				// 원본이 없으면 폴더를 건드리지 않는다 (직접 넣어 둔 맵 보호). dirty 는 그대로 두고 잠시 뒤 다시 찾아본다.
+				// 원본을 넣으면 곧바로(로비 상태일 때) 새 복사본으로 교체된다.
+				s.sourceProblem = true;
+				s.cooldown = SOURCE_RECHECK_TICKS;
+				if (!s.sourceWarned) {
+					s.sourceWarned = true;
+					LOG.warn("[BattleMaps] {} 의 원본을 찾지 못해 초기화를 건너뜁니다. {} 아래에 region 폴더(.mca 파일이 든)가 있어야 합니다.",
+						s.id, originals.resolve(s.name));
+				}
+				return;
+			}
+			if (!src.equals(originals.resolve(s.name))) {
+				LOG.info("[BattleMaps] {} 원본의 region 폴더를 {} 에서 찾았습니다.", s.id, src);
+			}
 		}
+		s.sourceProblem = false;
+		s.sourceWarned = false;
+		s.source = src;
 		LOG.info("[BattleMaps] {} 초기화 시작", s.id);
 		s.waitTicks = 0;
 		s.phase = MapSlot.Phase.DELETING;
-		if (s.handle != null && server.getLevel(s.levelKey) != null) {
+		ServerLevel open = server.getLevel(s.levelKey);
+		if (s.handle != null && open != null) {
+			s.oldLevel = open;
 			s.handle.delete();
 		} else {
 			s.handle = null;
+			s.oldLevel = null;
 			afterDeleted(s);
+		}
+	}
+
+	/** 도시 원본에서 region 폴더(.mca 파일이 든)를 가진 폴더를 찾는다. 없으면 null. */
+	private Path findSource(MapSlot s) {
+		Path base = originals.resolve(s.name);
+		if (!Files.isDirectory(base)) {
+			return null;
+		}
+		// 1) 안내한 위치: cityN/region
+		if (hasMca(base.resolve("region"))) {
+			return base;
+		}
+		// 2) 26.x 월드를 통째로 넣은 경우: cityN/dimensions/minecraft/overworld/region
+		Path overworld = base.resolve("dimensions").resolve("minecraft").resolve("overworld");
+		if (hasMca(overworld.resolve("region"))) {
+			return overworld;
+		}
+		// 3) 그 밖에 폴더가 더 겹쳐 있는 경우: 6단계 안에서 가장 얕은 region (네더/엔드 폴더는 제외)
+		List<Path> found = new ArrayList<>();
+		try (Stream<Path> walk = Files.walk(base, 6)) {
+			walk.filter(p -> p.getFileName() != null && p.getFileName().toString().equals("region"))
+				.filter(p -> !inOtherDimension(base.relativize(p)))
+				.filter(this::hasMca)
+				.forEach(found::add);
+		} catch (IOException | UncheckedIOException e) {
+			LOG.warn("[BattleMaps] {} 원본 폴더를 훑는 중 오류: {}", s.id, e.toString());
+		}
+		found.sort(Comparator.comparingInt(Path::getNameCount).thenComparing(Path::toString));
+		return found.isEmpty() ? null : found.get(0).getParent();
+	}
+
+	private static boolean inOtherDimension(Path relative) {
+		for (Path part : relative) {
+			String n = part.toString().toLowerCase(Locale.ROOT);
+			if (n.equals("dim-1") || n.equals("dim1") || n.equals("the_nether") || n.equals("the_end")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean hasMca(Path regionDir) {
+		return countMca(regionDir) > 0;
+	}
+
+	private static int countMca(Path regionDir) {
+		if (!Files.isDirectory(regionDir)) {
+			return 0;
+		}
+		try (Stream<Path> list = Files.list(regionDir)) {
+			return (int) list.filter(p -> p.getFileName().toString().endsWith(".mca")).count();
+		} catch (IOException | UncheckedIOException e) {
+			return 0;
 		}
 	}
 
@@ -280,11 +393,22 @@ final class MapManager {
 			case DELETING -> {
 				if (server.getLevel(s.levelKey) == null) {
 					s.handle = null;
-					afterDeleted(s);
+					beginClose(s);
 				} else if (++s.waitTicks > DELETE_TIMEOUT) {
 					LOG.error("[BattleMaps] {} 월드 삭제가 끝나지 않습니다. 잠시 뒤 다시 시도합니다.", s.id);
+					s.oldLevel = null;
 					s.phase = MapSlot.Phase.OPEN;
 					s.cooldown = RETRY_TICKS;
+				}
+			}
+			case CLOSING -> {
+				boolean done = s.closing == null || s.closing.isDone();
+				if (done || ++s.waitTicks > CLOSE_TIMEOUT) {
+					if (!done) {
+						LOG.warn("[BattleMaps] {} 옛 월드를 닫는 데 오래 걸려 기다리지 않고 진행합니다.", s.id);
+					}
+					s.closing = null;
+					afterDeleted(s);
 				}
 			}
 			case COPYING -> {
@@ -306,13 +430,43 @@ final class MapManager {
 		}
 	}
 
+	/**
+	 * 게임이 월드를 목록에서 뺀 직후. 게임(Fantasy)은 월드 객체를 닫지 않고 폴더만 지우기 때문에,
+	 * 닫지 않은 옛 월드가 밀린 청크 저장을 나중에 새 폴더에 써 넣거나(옛 플레이 흔적이 새 복사본을 덮어씀),
+	 * 파일을 붙잡고 있을 수 있다. 그래서 옛 월드 객체를 직접 닫아서(남은 쓰기를 모두 끝내고 파일을 놓게 함) 정리한다.
+	 */
+	private void beginClose(MapSlot s) {
+		ServerLevel old = s.oldLevel;
+		s.oldLevel = null;
+		if (Files.exists(s.dir)) {
+			// 게임의 폴더 삭제가 덜 끝났다 (파일 잠금 등). 게임이 '종료 때 지우기'를 예약했을 수 있으므로,
+			// 서버를 끌 때 이 맵을 '쓴 맵'으로 기록해서 다음 실행에 원본으로 다시 채우게 한다.
+			s.exitRisk = true;
+			LOG.warn("[BattleMaps] {} 폴더가 월드 삭제 뒤에도 남아 있습니다. 직접 정리합니다.", s.id);
+		}
+		if (old == null) {
+			afterDeleted(s);
+			return;
+		}
+		s.phase = MapSlot.Phase.CLOSING;
+		s.waitTicks = 0;
+		s.closing = CompletableFuture.runAsync(() -> {
+			try {
+				old.close();
+			} catch (Throwable t) {
+				LOG.warn("[BattleMaps] {} 옛 월드를 닫는 중 오류 (무시하고 계속합니다): {}", s.id, t.toString());
+			}
+		}, closer);
+	}
+
 	/** 월드가 닫힌 뒤: 폴더 정리 -> (야생) 새 시드로 바로 열기 / (도시) 원본 복사 시작 */
 	private void afterDeleted(MapSlot s) {
 		Path dir = s.dir;
 		if (!FileTools.deleteTree(dir)) {
-			LOG.error("[BattleMaps] {} 폴더를 지우지 못했습니다 (파일이 열려 있을 수 있음). 서버를 껐다 켜면 다시 시도합니다.", s.id);
+			LOG.error("[BattleMaps] {} 폴더를 지우지 못했습니다 (파일이 열려 있을 수 있음). 5분 뒤 다시 시도합니다.", s.id);
+			s.exitRisk = true;
 			s.phase = MapSlot.Phase.CLOSED;
-			s.cooldown = Integer.MAX_VALUE;
+			s.cooldown = DELETE_RETRY_TICKS;
 			openLevelIfPossible(s);
 			return;
 		}
@@ -323,24 +477,44 @@ final class MapManager {
 			return;
 		}
 
-		Path orig = originals.resolve(s.name);
+		Path src = s.source;
 		s.phase = MapSlot.Phase.COPYING;
 		s.copy = CompletableFuture.runAsync(() -> {
 			try {
-				FileTools.copyTree(orig, dir);
+				copyOriginal(src, dir);
 			} catch (IOException e) {
 				throw new UncheckedIOException(e);
 			}
 		}, io);
-		LOG.info("[BattleMaps] {} 원본 복사 중...", s.id);
+		LOG.info("[BattleMaps] {} 원본 복사 중... ({})", s.id, src);
 	}
 
-	/** 폴더 준비가 끝났다 -> 월드를 열고, 성공하면 '깨끗함'으로 표시 */
+	/** 원본 폴더에서 region / entities / poi 만 가져온다. */
+	private static void copyOriginal(Path src, Path dst) throws IOException {
+		Files.createDirectories(dst);
+		for (String name : COPY_DIRS) {
+			Path from = src.resolve(name);
+			if (Files.isDirectory(from)) {
+				FileTools.copyTree(from, dst.resolve(name));
+			}
+		}
+	}
+
+	/** 폴더 준비가 끝났다 -> (도시는 복사 결과를 확인하고) 월드를 열고, 성공하면 '깨끗함'으로 표시 */
 	private void finishReset(MapSlot s, boolean filesOk) {
+		int regions = -1;
+		if (!s.wild && filesOk) {
+			regions = countMca(s.dir.resolve("region"));
+			if (regions <= 0) {
+				filesOk = false;
+				LOG.error("[BattleMaps] {} 복사가 끝났는데 {} 에 .mca 파일이 없습니다.", s.id, s.dir.resolve("region"));
+			}
+		}
 		boolean opened = openLevel(s);
 		if (filesOk && opened) {
 			s.dirty = false;
-			LOG.info("[BattleMaps] {} 새 맵 준비 완료", s.id);
+			s.sourceProblem = false;
+			LOG.info("[BattleMaps] {} 새 맵 준비 완료{}", s.id, regions >= 0 ? " (region 파일 " + regions + "개)" : "");
 		} else {
 			s.cooldown = RETRY_TICKS;
 		}
@@ -422,7 +596,7 @@ final class MapManager {
 		o.addProperty("note", "battle_maps 모드가 관리하는 파일입니다. dirty = 아직 새 복사본이 아닌(게임에 쓰인) 맵.");
 		JsonArray dirty = new JsonArray();
 		for (MapSlot s : slots) {
-			if (s.dirty) {
+			if (s.dirty || s.exitRisk) {
 				dirty.add(s.name);
 			}
 		}
@@ -457,12 +631,27 @@ final class MapManager {
 		return true;
 	}
 
-	/** #maps bt.state : 1 = 모든 맵 준비됨, 2 = 초기화 중, 3 = 오류(월드를 못 연 맵이 있음) */
+	/** 맵 하나의 상태 번호 (#st1~#st4): 0 = 새 복사본, 1 = 쓴 맵(초기화 대기), 2 = 초기화 중, 3 = 월드를 못 열었음, 4 = 쓴 맵인데 원본을 못 찾음 */
+	private static int statusOf(MapSlot s) {
+		return switch (s.phase) {
+			case CLOSED -> 3;
+			case DELETING, CLOSING, COPYING -> 2;
+			case OPEN -> s.dirty ? (s.sourceProblem ? 4 : 1) : 0;
+		};
+	}
+
+	/**
+	 * #maps bt.state : 1 = 모든 맵 준비됨, 2 = 초기화 중, 3 = 오류(월드를 못 연 맵이 있음)
+	 * #st1~#st4 bt.state : 맵별 상태 (statusOf 참고) - 데이터팩의 /function battle:admin/maps 가 보여 줌
+	 */
 	private void publish(boolean force) {
 		boolean busy = false;
 		boolean error = false;
-		for (MapSlot s : slots) {
-			if (s.phase == MapSlot.Phase.DELETING || s.phase == MapSlot.Phase.COPYING) {
+		int[] status = new int[slots.size()];
+		for (int i = 0; i < slots.size(); i++) {
+			MapSlot s = slots.get(i);
+			status[i] = statusOf(s);
+			if (s.phase == MapSlot.Phase.DELETING || s.phase == MapSlot.Phase.CLOSING || s.phase == MapSlot.Phase.COPYING) {
 				busy = true;
 			} else if (s.phase == MapSlot.Phase.CLOSED) {
 				error = true;
@@ -470,12 +659,16 @@ final class MapManager {
 		}
 		int value = error ? 3 : (busy ? 2 : 1);
 		sincePublish++;
-		if (force || value != published || sincePublish >= 100) {
+		if (force || value != published || !Arrays.equals(status, publishedStatus) || sincePublish >= 100) {
 			if (writeScore("#maps", value)) {
+				for (int i = 0; i < slots.size(); i++) {
+					writeScore("#st" + slots.get(i).mapIndex, status[i]);
+				}
 				if (value != published) {
 					LOG.info("[BattleMaps] 맵 상태: {}", value == 1 ? "준비됨" : (value == 2 ? "초기화 중" : "오류"));
 				}
 				published = value;
+				publishedStatus = status;
 				sincePublish = 0;
 			}
 		}
