@@ -13,17 +13,17 @@
 1. 깃허브에 새 저장소를 만들고 이 폴더(`battle_mod`)의 **모든 파일**(숨김 폴더 `.github` 포함)을 올립니다.
 2. 저장소의 **Actions** 탭 → 가장 위의 `build` 실행이 초록색이 될 때까지 기다립니다.
 3. 실행을 열고 아래쪽 **Artifacts → battle-maps** 를 내려받아 압축을 풉니다.
-4. 안에 있는 `battle-maps-1.0.0.jar` (`-sources` 가 붙지 않은 것)를 호스트 PC 의 `mods` 폴더(윈도우: `%appdata%\.minecraft\mods`)에 넣습니다.
+4. 안에 있는 `battle-maps-1.0.1.jar` (`-sources` 가 붙지 않은 것)를 호스트 PC 의 `mods` 폴더(윈도우: `%appdata%\.minecraft\mods`)에 넣습니다.
 
 ### B. 내 컴퓨터에서 빌드
 1. **JDK 25** 를 설치합니다.
 2. 이 폴더에서 `./gradlew build` (윈도우는 `gradlew.bat build`) 를 실행합니다. 처음에는 마인크래프트와 라이브러리를 내려받느라 몇 분 걸립니다.
-3. `build/libs/battle-maps-1.0.0.jar` 이 결과물입니다.
+3. `build/libs/battle-maps-1.0.1.jar` 이 결과물입니다.
 
 > **빌드가 실패하면** 로그(빨간 글씨 부분)를 그대로 알려 주세요. 이 모드는 마인크래프트 본체를 내려받을 수 없는 환경에서 작성되어 컴파일해 보지 못했습니다.
 
 ## 필요한 것
-LAN으로 여는 **호스트 PC**의 마인크래프트(26.1.x)에 Fabric Loader · Fabric API(26.1 용) · 이 모드 `.jar` 를 `mods` 폴더에 설치합니다. 접속만 하는 친구들은 아무것도 설치하지 않아도 됩니다. (월드 생성 라이브러리 [Fantasy](https://github.com/NucleoidMC/fantasy) 0.8.0+26.1.2 는 모드 안에 포함됨. 전용 서버로 열 때는 서버에 같은 것들 + Java 25)
+LAN으로 여는 **호스트 PC**의 마인크래프트(**26.3**)에 Fabric Loader · Fabric API(26.3 용) · 이 모드 `.jar` 를 `mods` 폴더에 설치합니다. 접속만 하는 친구들은 아무것도 설치하지 않아도 됩니다. (월드 생성 라이브러리 [Fantasy](https://github.com/NucleoidMC/fantasy) 0.8.4+26.3 은 모드 안에 포함됨. 전용 서버로 열 때는 서버에 같은 것들 + Java 25)
 
 자세한 설치 순서는 데이터팩 쪽 `README_맵_설치.md` 의 *1. 설치* 를 보세요.
 
@@ -53,6 +53,6 @@ LAN으로 여는 **호스트 PC**의 마인크래프트(26.1.x)에 Fabric Loader
 야생은 일반 오버월드 지형, 도시는 원본 파일이 없는 바깥쪽을 채우는 평지입니다. 둘 다 `MapManager.java` 맨 위의 `ARENA_GENERATOR` / `CITY_GENERATOR` JSON 에 있고, 형식은 데이터팩 dimension 파일의 `generator` 와 같습니다.
 
 ## 알려진 한계 · 확인이 필요한 점
-- 월드 폴더 위치(`<월드>/dimensions/battle/<이름>/`)는 26.1 의 저장 구조를 기준으로 합니다. 다르면 원본이 복사돼도 게임에 반영되지 않습니다. 첫 실행 로그(`.minecraft/logs/latest.log`)의 `[BattleMaps] 월드 폴더:` 줄과 실제 폴더를 비교해 보세요.
+- 월드 폴더 위치(`<월드>/dimensions/battle/<이름>/`)는 기본 가정이고, 모드는 먼저 게임에게 실제 저장 폴더를 물어봅니다. 첫 실행 로그(`.minecraft/logs/latest.log`)의 `[BattleMaps] 월드 폴더:` 줄에 모드가 쓰는 폴더가 찍히니 실제 폴더와 비교해 보세요.
 - 윈도우에서 파일이 열려 있어 삭제에 실패하면 로그에 오류가 남고, 그 맵은 월드를 다시 열 때 초기화됩니다.
 - 맵 월드의 월드보더가 데이터팩의 `worldborder` 명령(월드별 설정)대로 독립적으로 움직이는지는 게임에서 확인이 필요합니다.

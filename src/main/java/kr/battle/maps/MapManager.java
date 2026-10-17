@@ -10,6 +10,8 @@ import com.mojang.serialization.DataResult;
 import com.mojang.serialization.JsonOps;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -120,12 +122,38 @@ final class MapManager {
 		slots.add(new MapSlot(2, "city1", false, CITY_GENERATOR));
 		slots.add(new MapSlot(3, "city2", false, CITY_GENERATOR));
 		slots.add(new MapSlot(4, "city3", false, CITY_GENERATOR));
+		for (MapSlot s : slots) {
+			s.dir = resolveDir(s);
+		}
+	}
+
+	/**
+	 * 맵 월드의 저장 폴더. 게임(LevelStorageAccess.getDimensionPath)에게 직접 물어보고,
+	 * 물어보지 못하면 <월드>/dimensions/battle/<이름> 으로 가정한다.
+	 */
+	private Path resolveDir(MapSlot s) {
+		Path fallback = dimDir.resolve(s.name);
+		try {
+			Field field = MinecraftServer.class.getDeclaredField("storageSource");
+			field.setAccessible(true);
+			Object access = field.get(server);
+			Method method = access.getClass().getMethod("getDimensionPath", ResourceKey.class);
+			Object result = method.invoke(access, s.levelKey);
+			if (result instanceof Path path) {
+				return path;
+			}
+		} catch (Throwable t) {
+			LOG.info("[BattleMaps] {} 저장 폴더를 게임에게 묻지 못해 기본 위치를 씁니다 ({})", s.id, t.toString());
+		}
+		return fallback;
 	}
 
 	// ------------------------------------------------------------------ 시작 / 종료
 
 	void onStart() {
-		LOG.info("[BattleMaps] 월드 폴더: {}", dimDir);
+		for (MapSlot s : slots) {
+			LOG.info("[BattleMaps] 월드 폴더: {} -> {}", s.id, s.dir);
+		}
 		LOG.info("[BattleMaps] 원본 맵 폴더: {}", originals);
 		loadState();
 		for (MapSlot s : slots) {
@@ -280,7 +308,7 @@ final class MapManager {
 
 	/** 월드가 닫힌 뒤: 폴더 정리 -> (야생) 새 시드로 바로 열기 / (도시) 원본 복사 시작 */
 	private void afterDeleted(MapSlot s) {
-		Path dir = dimDir.resolve(s.name);
+		Path dir = s.dir;
 		if (!FileTools.deleteTree(dir)) {
 			LOG.error("[BattleMaps] {} 폴더를 지우지 못했습니다 (파일이 열려 있을 수 있음). 서버를 껐다 켜면 다시 시도합니다.", s.id);
 			s.phase = MapSlot.Phase.CLOSED;

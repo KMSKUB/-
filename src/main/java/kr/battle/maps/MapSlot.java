@@ -1,5 +1,6 @@
 package kr.battle.maps;
 
+import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
@@ -30,6 +31,9 @@ final class MapSlot {
 	final String generatorJson;
 	final Identifier id;
 	final ResourceKey<Level> levelKey;
+
+	/** 이 맵 월드의 저장 폴더 (게임이 실제로 쓰는 위치) */
+	Path dir;
 
 	/** true = 폴더 내용이 '깨끗한 새 복사본'이 아님 (게임에 쓰였거나, 아직 한 번도 초기화되지 않음) */
 	boolean dirty;
