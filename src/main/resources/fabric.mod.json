@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "battle_maps",
+	"version": "${version}",
+	"name": "Battle Maps (능력 배틀 맵 관리)",
+	"description": "능력 배틀 데이터팩용 서버 모드. 게임이 끝나면 쓴 맵을 삭제하고, 도시 맵은 원본의 새 복사본으로 바꾸며, 야생 맵은 새 월드로 다시 만듭니다.",
+	"authors": [
+		"초 미소녀 클로드 쨩"
+	],
+	"license": "CC0-1.0",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"kr.battle.maps.BattleMaps"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.18.0",
+		"minecraft": "~26.1",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
